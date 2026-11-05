@@ -101,12 +101,22 @@ button.primary,button[aria-pressed="true"]{background:var(--accent);color:#fff}
 <form id="edit-menu" class="form"><div class="grid"><label>餐點名稱<input name="name" maxlength="60" required></label><label>分類<input name="category" maxlength="30" required></label>
 <label>售價（元）<input type="number" name="price" min="0" max="1000000" step="1" required></label><label>菜單照片<input type="file" name="photo" accept="image/jpeg,image/png,image/webp"></label></div>
 <label class="tick"><input type="checkbox" name="active" checked>供應中，顯示在公開菜單</label><button class="primary" type="submit">儲存餐點</button></form></section>
-<section id="staff-admin" class="panel" hidden><h2>新增員工或調整權限</h2><form id="staff-form" class="form">
-<label>員工電子郵件<input type="email" name="email" maxlength="254" required></label>
-<label>新帳號初始密碼<input type="password" name="password" autocomplete="new-password" minlength="12" maxlength="72"></label>
-<p class="muted">已有帳號時可留空，只更新權限。新帳號的初始密碼請個別交給員工。</p>
+<section id="staff-admin" class="panel" hidden><h2>員工管理</h2>
+<details><summary>修改管理者自己的密碼</summary><form id="own-password-form" class="form">
+<label>目前密碼<input type="password" name="current" autocomplete="current-password" required></label>
+<label>新密碼<input type="password" name="password" autocomplete="new-password" minlength="12" maxlength="72" required></label>
+<label>再次輸入新密碼<input type="password" name="confirm" autocomplete="new-password" minlength="12" maxlength="72" required></label>
+<button class="primary" type="submit">修改自己的密碼</button><p id="own-password-status" role="status"></p></form></details>
+<div class="row"><h3>帳號清單</h3><button type="button" id="staff-refresh">重新整理</button></div>
+<p id="staff-status" role="status"></p><div id="staff-list"></div>
+<h3 id="staff-editor-title">新增員工</h3><form id="staff-form" class="form">
+<input type="hidden" name="id"><label>員工姓名<input name="name" maxlength="60" autocomplete="name"></label>
+<label>員工電子郵件<input type="email" name="email" maxlength="254" autocomplete="off" required></label>
+<label id="staff-password-label">初始密碼／重設密碼<input type="password" name="password" autocomplete="new-password" minlength="12" maxlength="72"></label>
+<p class="muted">新增帳號需設定密碼；修改既有帳號時，密碼留白代表保留原密碼。至少 12 個字元，最多 72 位元組。</p>
 <label>權限<select name="role"><option value="staff">櫃台</option><option value="kitchen">廚房</option></select></label>
-<button class="primary" type="submit">儲存員工</button></form></section>
+<div class="actions"><button class="primary" type="submit">儲存員工</button><button type="button" id="staff-cancel">取消修改／新增另一位</button></div>
+<p id="staff-edit-status" role="status"></p></form></section>
 <section id="revenue" class="panel" hidden><h2>營收統計</h2><form id="report-form" class="form"><div class="grid"><label>統計期間<select name="grain"><option value="day">日</option><option value="month">月</option><option value="year">年</option></select></label>
 <label>期間內的日期<input type="date" name="date" required></label></div><button class="primary" type="submit">查詢營收</button></form><p id="revenue-result" role="status"></p><div id="revenue-details"></div></section>
 </div><section id="booking-overview" class="panel" hidden aria-labelledby="booking-overview-title">
@@ -470,6 +480,7 @@ for(const control of document.querySelectorAll('[data-tab]')) {
     if(tab==='bookings'||tab==='sales') refresh(tab);
     if(tab==='kitchen') loadKitchen();
     if(tab==='open-tables') loadOpenTables();
+    if(tab==='staff-admin') void loadStaff();
     if(tab==='menu-admin') loadCatalog().catch(error=>{notice.textContent=error.message;});
   });
 }
@@ -674,17 +685,108 @@ onForm('edit-menu',async el=>{
   await start();
   notice.textContent='餐點已儲存。';
 });
-onForm('staff-form',async el=>{
+let staffAccounts=[];
+let staffLoading=false;
+let staffMutating=false;
+const staffForm=byId('staff-form');
+function resetStaffEditor() {
+  staffForm.reset();
+  staffForm.elements.id.value='';
+  byId('staff-editor-title').textContent='新增員工';
+}
+async function staffRequest(body) {
+  const {data,error}=await db.functions.invoke('linglan-staff',{body});
+  if(error) {
+    let detail;
+    try {detail=(await error.context.json()).message;} catch {}
+    throw Error(detail||'員工管理連線失敗，請確認新版 linglan-staff 函式已部署。');
+  }
+  if(data?.message || (!data?.ok && body.action!=='list')) throw Error(data?.message||'員工管理回應不完整，請更新 linglan-staff 函式。');
+  if(body.action==='list' && (data?.version!==8 || !Array.isArray(data.users))) throw Error('請先部署新版 linglan-staff 函式，才能顯示員工清單。');
+  return data;
+}
+async function loadStaff() {
+  if(staffRole!=='owner'||staffLoading) return;
+  staffLoading=true;
+  byId('staff-refresh').disabled=true;
+  byId('staff-status').textContent='載入帳號中…';
   try {
-    const {error}=await db.functions.invoke('linglan-staff',{body:Object.fromEntries(new FormData(el))});
-    if(error) {
-      let detail;
-      try {detail=(await error.context.json()).message;} catch {}
-      throw Error(detail||'員工設定失敗。請確認 linglan-staff 函式已部署。');
+    const data=await staffRequest({action:'list'});
+    staffAccounts=data.users;
+    const list=byId('staff-list');list.replaceChildren();
+    for(const account of staffAccounts) {
+      const row=node('article',undefined,'booking-item');
+      const roleName={owner:'管理者',staff:'櫃台',kitchen:'廚房'}[account.role]??'未授權／已移除員工資格';
+      row.append(node('strong',account.name||account.email||'未設定姓名'),node('p',account.email),node('p',roleName+(account.self?'（目前登入）':'')));
+      if(!account.self && account.role!=='owner') {
+        const actions=node('div',undefined,'actions');
+        actions.append(button('修改',()=>{
+          if(staffMutating) return;
+          staffForm.reset();
+          staffForm.elements.id.value=account.id;
+          staffForm.elements.name.value=account.name;
+          staffForm.elements.email.value=account.email;
+          staffForm.elements.role.value=account.role==='kitchen'?'kitchen':'staff';
+          byId('staff-editor-title').textContent='修改員工';
+          byId('staff-edit-status').textContent='';
+          byId('staff-editor-title').scrollIntoView({block:'nearest'});
+        }),button('刪除',()=>void deleteStaff(account)));
+        row.append(actions);
+      }
+      list.append(row);
     }
+    byId('staff-status').textContent=staffAccounts.length?'共 '+staffAccounts.length+' 個帳號':'目前沒有帳號。';
+  } catch(error) {byId('staff-status').textContent=error.message;}
+  finally {staffLoading=false;byId('staff-refresh').disabled=false;}
+}
+function lockStaff(value) {
+  staffMutating=value;
+  for(const control of staffForm.elements) control.disabled=value;
+  for(const control of byId('staff-list').querySelectorAll('button')) control.disabled=value;
+}
+async function deleteStaff(account) {
+  if(staffMutating || !confirm('確定刪除「'+account.email+'」的員工帳號？該員工將無法再操作；既有交易與訂位會保留。')) return;
+  lockStaff(true);
+  byId('staff-edit-status').textContent='正在刪除…';
+  try {
+    const data=await staffRequest({action:'delete',id:account.id});
+    if(staffForm.elements.id.value===account.id) resetStaffEditor();
+    byId('staff-edit-status').textContent=data.warning||'員工帳號已刪除。';
+    await loadStaff();
+  } catch(error) {byId('staff-edit-status').textContent=error.message;}
+  finally {lockStaff(false);}
+}
+byId('staff-refresh').addEventListener('click',()=>{if(!staffMutating) void loadStaff();});
+byId('staff-cancel').addEventListener('click',()=>{if(!staffMutating){resetStaffEditor();byId('staff-edit-status').textContent='';}});
+onForm('staff-form',async el=>{
+  if(staffMutating) return;
+  const payload={action:'save',...Object.fromEntries(new FormData(el))};
+  lockStaff(true);
+  byId('staff-edit-status').textContent='儲存中…';
+  try {
+    await staffRequest(payload);
+    resetStaffEditor();
+    byId('staff-edit-status').textContent='員工帳號及權限已儲存。';
+  } catch(error) {byId('staff-edit-status').textContent=error.message;}
+  finally {
+    el.elements.password.value='';
+    lockStaff(false);
+    await loadStaff();
+  }
+});
+onForm('own-password-form',async el=>{
+  const status=byId('own-password-status');
+  try {
+    if(staffRole!=='owner') throw Error('需要管理者權限。');
+    const password=el.elements.password.value;
+    if(password!==el.elements.confirm.value) throw Error('兩次新密碼不一致。');
+    if(password.length<12 || new TextEncoder().encode(password).length>72) throw Error('新密碼至少 12 個字元，最多 72 位元組。');
+    status.textContent='修改中…';
+    await checked(db.auth.updateUser({password,current_password:el.elements.current.value}));
     el.reset();
-    notice.textContent='員工帳號及權限已儲存。';
-  } finally {el.elements.password.value='';}
+    status.textContent='密碼已修改，下次登入請使用新密碼。';
+  } catch(error) {status.textContent=error.message;}
+  finally {for(const input of el.querySelectorAll('input[type="password"]')) input.value='';}
 });
 function revenueBounds(grain,date) {
   const start=new Date(date+'T00:00:00Z');
